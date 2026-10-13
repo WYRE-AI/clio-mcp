@@ -28,9 +28,10 @@ function firstHeaderValue(value: string | string[] | undefined): string | undefi
  *   X-Clio-Client-Id      (optional -- required only if a refresh token is present)
  *   X-Clio-Client-Secret  (optional -- required only if a refresh token is present)
  *   X-Clio-Region         (optional, default 'us')
- * Returns null when no access token header is present -- callers must NOT
- * reject the request outright: `tools/list` still works without credentials,
- * only `tools/call` needs them.
+ * Returns null when no access token header is present. HTTP gateway mode
+ * rejects that request with 401 and does not fall back to CLIO_* env vars.
+ * Env / stdio mode may still serve a request with no headers; `tools/call`
+ * then fails inside getClient() when no credentials exist.
  */
 export function credentialsFromHeaders(
   headers: Record<string, string | string[] | undefined>

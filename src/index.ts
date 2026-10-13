@@ -5,13 +5,15 @@ import { logger } from './utils/logger.js';
 
 /**
  * Entry point (skill 2.2). `MCP_TRANSPORT=http` runs the gateway-facing HTTP
- * streaming server (src/http.ts); otherwise this starts a single stdio
- * server, for local/CLI use against a single set of CLIO_* env credentials.
+ * streaming server (src/http.ts). HTTP refuses to start without a real
+ * CONDUIT_S2S_SECRET unless MCP_ALLOW_INSECURE_DEV=1, which binds 127.0.0.1
+ * only. Otherwise this starts a single stdio server, for local/CLI use
+ * against a single set of CLIO_* env credentials. stdio does not use S2S.
  */
 async function main(): Promise<void> {
   if (process.env.MCP_TRANSPORT === 'http') {
     const { startHttpServer } = await import('./http.js');
-    startHttpServer();
+    await startHttpServer();
     return;
   }
 
