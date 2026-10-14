@@ -24,10 +24,38 @@ Packages -- see `.npmrc` (registry + token) if installing outside CI.
 
 ## Running
 
+Copy [`.env.example`](.env.example) and set the variables below. Never commit a real secret.
+
 ```bash
 npm run start        # stdio transport, reads CLIO_* env vars
-npm run start:http    # HTTP streaming transport (gateway mode), reads X-Clio-* headers per request
+npm run start:http   # HTTP transport; refuses to start until CONDUIT_S2S_SECRET is set
 ```
+
+Local HTTP without a service-to-service secret is development-only. It logs a warning, does not check
+`X-Gateway-S2S`, and binds `127.0.0.1` only (a non-loopback `MCP_HTTP_HOST`, including `0.0.0.0`, is
+ignored and the override is logged):
+
+```bash
+MCP_ALLOW_INSECURE_DEV=1 npm run start:http
+```
+
+### Configuration
+
+| Variable | Required | Description |
+|---|---|---|
+| `CLIO_ACCESS_TOKEN` | For stdio and `AUTH_MODE=env` | OAuth bearer access token. |
+| `CLIO_REFRESH_TOKEN` | No | Enables automatic refresh-on-401. |
+| `CLIO_CLIENT_ID` | No | Required alongside a refresh token. |
+| `CLIO_CLIENT_SECRET` | No | Required alongside a refresh token. |
+| `CLIO_REGION` | No | `us` (default), `ca`, `eu`, or `au`. |
+| `MCP_TRANSPORT` | No | `stdio` (default) or `http`. |
+| `AUTH_MODE` | No | `gateway` (Docker image and Compose default) or `env`. Gateway mode requires `X-Clio-Access-Token` on each `/mcp` request and never falls back to `CLIO_*`. `env` uses those variables only after S2S auth succeeds. |
+| `CONDUIT_S2S_SECRET` | Yes for HTTP | Service-to-service secret. The HTTP server logs an error and exits non-zero when this is empty or a known placeholder (`changeme`, `your-s2s-secret`, `replace-with-a-real-secret`, and the other public example values). Compose will not start when it is unset. The value is never logged. Generate one with `openssl rand -hex 32`. |
+| `MCP_ALLOW_INSECURE_DEV` | No | Set to exactly `1` only for local development to start HTTP without `CONDUIT_S2S_SECRET`. The process logs a warning and does not enforce `X-Gateway-S2S`. The listener is forced to `127.0.0.1`. A placeholder secret is still refused. |
+| `MCP_HTTP_HOST` | No | Bind address when a secret is configured. Defaults to `127.0.0.1` when unset. With no secret, the bind address is `127.0.0.1` even if this is set wider. The container image sets `0.0.0.0`. |
+| `MCP_HTTP_PORT` | No | HTTP port. Defaults to `8080`. |
+
+`/health` and `/healthz` stay unauthenticated and do not read credentials. The stdio transport does not use `CONDUIT_S2S_SECRET`.
 
 ### Credentials
 
@@ -36,19 +64,17 @@ authorize/token dance itself; something upstream (the WYRE MCP gateway, or your 
 that and hands this server a bearer access token.
 
 **Gateway mode** (`AUTH_MODE=gateway`, `MCP_TRANSPORT=http` -- the Docker image's default): credentials
-are read from request headers, per request:
+are read from request headers, per request. A request missing `X-Clio-Access-Token` gets `401` and does
+not fall back to `CLIO_*` in the process environment.
 
 | Header | Required | Description |
 |---|---|---|
+| `X-Gateway-S2S` | Yes, when `CONDUIT_S2S_SECRET` is set | Gateway service-to-service proof. See [HTTP authentication](#http-authentication). |
 | `X-Clio-Access-Token` | Yes | OAuth bearer access token. |
 | `X-Clio-Refresh-Token` | No | Enables automatic refresh-on-401. |
 | `X-Clio-Client-Id` | No | Required if `X-Clio-Refresh-Token` is present -- Clio's refresh flow needs the app's client id. |
 | `X-Clio-Client-Secret` | No | Required if `X-Clio-Refresh-Token` is present. |
 | `X-Clio-Region` | No | One of `us` \| `ca` \| `eu` \| `au`. Defaults to `us`. |
-
-A request with no `X-Clio-Access-Token` header is not rejected outright -- `initialize` and `tools/list`
-still work (so the gateway can discover tools before a user has connected), but any `tools/call` will
-fail with a clear "No Clio credentials configured" error.
 
 **stdio mode** (local/CLI use, a single set of credentials for the whole process): set environment
 variables instead:
@@ -66,6 +92,62 @@ not valid against another, and a Clio developer app registration is itself regio
 access token via the [Clio OAuth flow](https://docs.developers.clio.com/api-docs/clio-manage/authorization/)
 for the region you need; `@wyre-technology/node-clio` exports `buildAuthorizationUrl` /
 `exchangeAuthorizationCode` helpers for that.
+
+### HTTP authentication
+
+With `MCP_TRANSPORT=http` and `CONDUIT_S2S_SECRET` set, every `/mcp` request must include
+`X-Gateway-S2S`. The check is `verifyS2sHeader` in [`src/s2s-verify.ts`](src/s2s-verify.ts): the header
+value is `t=<unix seconds>,v1=<hex>`, where the hex is HMAC-SHA256 of the literal string
+`t=<unix seconds>` keyed with `CONDUIT_S2S_SECRET` (64 lowercase hex characters). The timestamp must be
+within 300 seconds of the server clock. A missing or invalid header is HTTP 401, before vendor
+credentials are read. The secret is never written to logs or error bodies.
+
+```
+t=1710000000,v1=<hmac-sha256(secret, "t=1710000000") as 64 lowercase hex chars>
+```
+
+In `AUTH_MODE=gateway`, `/mcp` also requires `X-Clio-Access-Token` (`X-Clio-Refresh-Token`,
+`X-Clio-Client-Id`, `X-Clio-Client-Secret`, and `X-Clio-Region` are optional). Those headers are the
+only credential source for that request.
+
+`AUTH_MODE=env` still requires a valid `X-Gateway-S2S` header, then uses `CLIO_*` from the process
+environment when the request does not carry `X-Clio-Access-Token`.
+
+### Docker
+
+The image listens on `0.0.0.0` inside the container (`MCP_HTTP_HOST`) and defaults to
+`AUTH_MODE=gateway`. Publish the port on loopback and pass the S2S secret. In gateway mode, Clio
+credentials arrive on each request as headers; they are not read from the environment.
+
+```bash
+docker build -t clio-mcp .
+docker run \
+  -e CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  -p 127.0.0.1:8080:8080 \
+  clio-mcp
+```
+
+The checked-in Compose service is gateway mode. It does not set `CLIO_ACCESS_TOKEN` or the other
+`CLIO_*` credential variables and does not use `env_file`, so a project `.env` cannot inject static
+vendor credentials into the container. Compose still interpolates `CONDUIT_S2S_SECRET` from that file
+and refuses to start when it is unset or empty. The published port is `127.0.0.1:8080:8080`.
+
+```bash
+CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" docker compose up
+```
+
+Single-tenant HTTP (`AUTH_MODE=env`) is separate from that gateway service. It still requires the S2S
+secret, then uses `CLIO_ACCESS_TOKEN`:
+
+```bash
+docker run \
+  -e CONDUIT_S2S_SECRET="$CONDUIT_S2S_SECRET" \
+  -e AUTH_MODE=env \
+  -e CLIO_ACCESS_TOKEN=your-access-token \
+  -e CLIO_REGION=us \
+  -p 127.0.0.1:8080:8080 \
+  clio-mcp
+```
 
 ## Tool navigation
 
@@ -196,7 +278,9 @@ src/
 
 Every HTTP request gets a fresh `Server` + `StreamableHTTPServerTransport` pair (stateless, no session
 ID) -- the gateway sends separate requests for `initialize`, `tools/list`, and `tools/call`, and a shared
-server would reject the second `initialize`. Per-request tenant credentials are carried in an
+server would reject the second `initialize`. `/mcp` requires a valid `X-Gateway-S2S` proof before any
+credential is read. In gateway mode, a request without `X-Clio-Access-Token` is rejected with 401 and
+does not fall back to the process environment. Per-request tenant credentials are carried in an
 `AsyncLocalStorage` context opened for the duration of that one request, so two concurrent requests
 bearing different tenants' tokens can never see each other's credentials.
 
@@ -208,8 +292,9 @@ npm test
 
 Tests mock the `@wyre-technology/node-clio` client and the MCP server's `elicitInput` -- no live Clio
 credentials are needed. Coverage: every domain's tool-definition shape (valid `inputSchema`, correct
-`readOnlyHint` per read vs. mutate), credential header parsing and client cache invalidation, and
-handler routing/elicitation behavior for representative tools in each domain.
+`readOnlyHint` per read vs. mutate), credential header parsing and client cache invalidation,
+handler routing/elicitation behavior for representative tools in each domain, and fail-closed HTTP
+startup (`CONDUIT_S2S_SECRET`, placeholder rejection, loopback-only dev bypass, gateway 401s).
 
 ## License
 

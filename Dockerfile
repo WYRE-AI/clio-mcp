@@ -12,7 +12,10 @@ RUN npm prune --omit=dev
 
 FROM node:26-alpine
 WORKDIR /app
-ENV NODE_ENV=production AUTH_MODE=gateway MCP_HTTP_PORT=8080 MCP_TRANSPORT=http
+# 0.0.0.0 is safe here only because startup refuses to listen without a real
+# CONDUIT_S2S_SECRET. MCP_ALLOW_INSECURE_DEV=1 forces 127.0.0.1 even when this
+# host is 0.0.0.0. AUTH_MODE=gateway never falls back to image env credentials.
+ENV NODE_ENV=production AUTH_MODE=gateway MCP_HTTP_PORT=8080 MCP_HTTP_HOST=0.0.0.0 MCP_TRANSPORT=http
 RUN addgroup -g 1001 -S mcp && adduser -u 1001 -S mcp -G mcp
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
